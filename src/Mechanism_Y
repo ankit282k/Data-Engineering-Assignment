@@ -1,0 +1,108 @@
+spark = SparkSession.builder \
+    .appName("DevDolphins_PatternDetection") \
+    .getOrCreate()
+
+# PostgreSQL connection props
+pg_url = "jdbc:postgresql://<host>:<port>/<db>"
+pg_properties = {
+    "user": "<user>",
+    "password": "<password>",
+    "driver": "org.postgresql.Driver"
+}
+
+# Load Customer Importance
+importance_df = spark.read.option("quote", "'").option("header", True).csv("s3a://your-bucket/CustomerImportance.csv") \
+    .withColumnRenamed("Source", "customer_name") \
+    .withColumnRenamed("Target", "merchant_id") \
+    .withColumnRenamed("typeTrans", "transaction_type") \
+    .withColumnRenamed("Weight", "weight") \
+    .select("customer_name", "merchant_id", "transaction_type", "weight")
+
+# Watch loop for chunk files (Mechanism Y)
+for i in range(50):
+    chunk_path = f"s3a://your-bucket/chunks/chunk_{i}.csv"
+    print(f"⏳ Processing {chunk_path}")
+    
+    df = spark.read.option("header", True).option("quote", "'").csv(chunk_path, inferSchema=True) \
+        .withColumnRenamed("customer", "customer_name") \
+        .withColumnRenamed("merchant", "merchant_id") \
+        .withColumnRenamed("category", "transaction_type") \
+        .withColumn("amount", col("amount").cast("double")) \
+        .withColumn("gender", regexp_replace("gender", "'", ""))
+
+    # TEMP METRICS for PostgreSQL
+    merchant_txn_count = df.groupBy("merchant_id", "customer_name").agg(count("*").alias("txn_count"))
+    total_txns_df = df.groupBy("merchant_id").agg(count("*").alias("total_txn"))
+
+    merchant_txn_count.write.jdbc(pg_url, "merchant_txn_snapshot", mode="append", properties=pg_properties)
+    total_txns_df.write.jdbc(pg_url, "merchant_txn_count", mode="overwrite", properties=pg_properties)
+
+    # === Pattern 1 — UPGRADE ===
+    joined1 = merchant_txn_count.join(
+        df.select("customer_name", "transaction_type"), "customer_name", "left"
+    ).join(
+        importance_df, ["customer_name", "transaction_type", "merchant_id"], "left"
+    )
+
+    avg_weight_df = joined1.groupBy("merchant_id", "customer_name") \
+        .agg(avg("weight").alias("avg_weight"))
+
+    thresholds_txn = merchant_txn_count.groupBy("merchant_id") \
+        .agg(expr("percentile(txn_count, array(0.9))")[0].alias("txn_90"))
+    
+    thresholds_weight = avg_weight_df.groupBy("merchant_id") \
+        .agg(expr("percentile(avg_weight, array(0.1))")[0].alias("wt_10"))
+
+    pattern1 = merchant_txn_count.join(avg_weight_df, ["merchant_id", "customer_name"]) \
+        .join(thresholds_txn, "merchant_id") \
+        .join(thresholds_weight, "merchant_id") \
+        .join(total_txns_df, "merchant_id") \
+        .filter((col("txn_count") >= col("txn_90")) &
+                (col("avg_weight") <= col("wt_10")) &
+                (col("total_txn") >= 50000)) \
+        .selectExpr("'PatId1' as patternId", "'UPGRADE' as actionType",
+                    "customer_name", "merchant_id")
+
+    # === Pattern 2 — CHILD ===
+    pattern2 = df.groupBy("customer_name", "merchant_id") \
+        .agg(avg("amount").alias("avg_amt"), count("*").alias("txn_count")) \
+        .filter((col("avg_amt") < 23) & (col("txn_count") >= 80)) \
+        .selectExpr("'PatId2' as patternId", "'CHILD' as actionType",
+                    "customer_name", "merchant_id")
+
+    # === Pattern 3 — DEI-NEEDED ===
+    gender_counts = df.groupBy("merchant_id", "gender").agg(count("*").alias("cnt"))
+    pivot = gender_counts.groupBy("merchant_id").pivot("gender").sum("cnt").na.fill(0)
+
+    if "F" in pivot.columns and "M" in pivot.columns:
+        pattern3 = pivot.filter((col("F") > 100) & (col("F") < col("M"))) \
+            .selectExpr("'' as customer_name", "merchant_id",
+                        "'PatId3' as patternId", "'DEI-NEEDED' as actionType")
+    else:
+        empty_schema = StructType([
+            StructField("customer_name", StringType(), True),
+            StructField("merchant_id", StringType(), True),
+            StructField("patternId", StringType(), True),
+            StructField("actionType", StringType(), True)
+        ])
+        pattern3 = spark.createDataFrame([], schema=empty_schema)
+
+    # === Combine all detections with empty string fill ===
+    for p in [pattern1, pattern2, pattern3]:
+        for colname in ["customer_name", "merchant_id", "patternId", "actionType"]:
+            if colname not in p.columns:
+                p = p.withColumn(colname, lit(""))
+
+    detections = pattern1.unionByName(pattern2).unionByName(pattern3) \
+        .withColumn("YStartTime", lit(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))) \
+        .withColumn("detectionTime", current_timestamp()) \
+        .select("YStartTime", "detectionTime", "patternId", "actionType", "customer_name", "merchant_id")
+
+    # === Write to S3 (50 rows only) ===
+    output_path = f"s3a://your-bucket/detections/detection_{i}_{int(time.time())}/"
+    detections.limit(50).coalesce(1).write.mode("overwrite").option("header", True).csv(output_path)
+
+    print(f"✅ Detections for chunk {i} written to {output_path}")
+    time.sleep(1)  # simulate every-second chunk (Mechanism X)
+
+

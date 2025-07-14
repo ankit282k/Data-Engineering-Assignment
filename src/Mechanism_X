@@ -1,0 +1,16 @@
+# Mechanism X
+
+import pandas as pd
+import boto3
+
+df = pd.read_csv("transactions.csv")
+chunk_size = 10000
+s3 = boto3.client('s3')
+
+for i, start in enumerate(range(0, len(df), chunk_size)):
+    chunk = df.iloc[start:start + chunk_size]
+    path = f"chunks/chunk_{i}.csv"
+    chunk.to_csv(path, index=False, quotechar="'")
+    s3.upload_file(path, "your-bucket", f"chunks/chunk_{i}.csv")
+
+
